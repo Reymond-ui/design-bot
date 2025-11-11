@@ -1,8 +1,9 @@
-import os
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+import os
 import sqlite3
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, \
+    ConversationHandler
 
 # Настройка логирования
 logging.basicConfig(
@@ -10,6 +11,9 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Состояния для ConversationHandler
+DESCRIPTION, FORMAT, STYLE, USAGE, ASPECT_RATIO, FILE_FORMAT = range(6)
 
 # Получаем токен из переменных окружения
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -21,9 +25,6 @@ if not BOT_TOKEN:
     except ImportError:
         logger.error("BOT_TOKEN not found in environment variables or config.py")
         exit(1)
-
-# Состояния для ConversationHandler
-DESCRIPTION, FORMAT, STYLE, USAGE, ASPECT_RATIO, FILE_FORMAT = range(6)
 
 
 # Инициализация базы данных
@@ -55,6 +56,14 @@ def init_db():
                   designer_username TEXT,
                   responded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                   FOREIGN KEY(request_id) REFERENCES requests(id))''')
+
+    # Таблица подписчиков на уведомления
+    c.execute('''CREATE TABLE IF NOT EXISTS subscribers
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER UNIQUE,
+                  user_name TEXT,
+                  user_username TEXT,
+                  subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
     # Проверяем существование новых колонок и добавляем их если нужно
     try:
@@ -111,6 +120,132 @@ async def start_create_request(update: Update, context: ContextTypes.DEFAULT_TYP
     return DESCRIPTION
 
 
+# Меню дизайнера
+async def show_designer_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    # Проверяем, подписан ли пользователь
+    conn = sqlite3.connect('design_requests.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM subscribers WHERE user_id = ?', (user.id,))
+    is_subscribed = c.fetchone() is not None
+    conn.close()
+
+    subscription_text = "🔕 Отписаться от уведомлений" if is_subscribed else "🔔 Подписаться на уведомления"
+    subscription_data = "unsubscribe_notifications" if is_subscribed else "subscribe_notifications"
+
+    keyboard = [
+        [InlineKeyboardButton("🎨 Посмотреть активные заявки", callback_data="show_active_requests")],
+        [InlineKeyboardButton(subscription_text, callback_data=subscription_data)],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        "👨‍🎨 Режим дизайнера\n\n"
+        "Здесь вы можете:\n"
+        "• Просматривать активные заявки\n"
+        "• Подписаться на уведомления о новых заявках\n"
+        "• Откликаться на понравившиеся проекты",
+        reply_markup=reply_markup
+    )
+
+
+# Обработка подписки на уведомления
+async def subscribe_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    conn = sqlite3.connect('design_requests.db')
+    c = conn.cursor()
+
+    try:
+        c.execute('INSERT OR REPLACE INTO subscribers (user_id, user_name, user_username) VALUES (?, ?, ?)',
+                  (user.id, user.full_name, user.username))
+        conn.commit()
+
+        await query.answer("✅ Вы подписались на уведомления о новых заявках!", show_alert=True)
+    except Exception as e:
+        logger.error(f"Ошибка подписки: {e}")
+        await query.answer("❌ Ошибка подписки. Попробуйте позже.", show_alert=True)
+    finally:
+        conn.close()
+
+    await show_designer_menu(update, context)
+
+
+# Обработка отписки от уведомлений
+async def unsubscribe_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    conn = sqlite3.connect('design_requests.db')
+    c = conn.cursor()
+
+    try:
+        c.execute('DELETE FROM subscribers WHERE user_id = ?', (user.id,))
+        conn.commit()
+
+        await query.answer("🔕 Вы отписались от уведомлений о новых заявках.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Ошибка отписки: {e}")
+        await query.answer("❌ Ошибка отписки. Попробуйте позже.", show_alert=True)
+    finally:
+        conn.close()
+
+    await show_designer_menu(update, context)
+
+
+# Функция рассылки уведомлений о новой заявке
+async def notify_subscribers_about_new_request(context: ContextTypes.DEFAULT_TYPE, request_id: int, request_data: dict):
+    """Рассылает уведомления о новой заявке всем подписчикам"""
+    conn = sqlite3.connect('design_requests.db')
+    c = conn.cursor()
+
+    # Получаем всех подписчиков
+    c.execute('SELECT user_id FROM subscribers')
+    subscribers = c.fetchall()
+    conn.close()
+
+    if not subscribers:
+        return
+
+    # Формируем сообщение о новой заявке
+    message_text = (
+        "🆕 Появилась новая заявка на дизайн!\n\n"
+        f"📋 Описание: {request_data['description'][:100]}...\n"
+        f"📄 Формат: {request_data['format']}\n"
+        f"🎨 Стиль: {request_data['style'][:50]}...\n"
+        f"📱 Использование: {request_data['usage'][:50]}...\n"
+        f"📐 Соотношение сторон: {request_data.get('aspect_ratio', 'Не указано')}\n"
+        f"📄 Формат файла: {request_data.get('file_format', 'Не указан')}\n\n"
+        f"🆔 Номер заявки: #{request_id}\n\n"
+        "🎨 Перейдите в режим дизайнера, чтобы откликнуться!"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("👨‍🎨 Посмотреть заявку", callback_data=f"respond_{request_id}")],
+        [InlineKeyboardButton("🔔 Настройки уведомлений", callback_data="designer_mode")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Рассылаем уведомления
+    successful_notifications = 0
+    for subscriber in subscribers:
+        try:
+            await context.bot.send_message(
+                chat_id=subscriber[0],
+                text=message_text,
+                reply_markup=reply_markup
+            )
+            successful_notifications += 1
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление пользователю {subscriber[0]}: {e}")
+
+    logger.info(f"Разослано уведомлений о заявке #{request_id}: {successful_notifications}/{len(subscribers)}")
+
+
 # Обработка кнопок главного меню
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -120,6 +255,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await start_create_request(update, context)
 
     elif query.data == "designer_mode":
+        await show_designer_menu(update, context)
+
+    elif query.data == "show_active_requests":
         await show_active_requests(update, context)
 
     elif query.data == "my_requests":
@@ -132,6 +270,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("delete_"):
         request_id = int(query.data.split("_")[1])
         await delete_request(update, context, request_id)
+
+    elif query.data == "subscribe_notifications":
+        await subscribe_notifications(update, context)
+
+    elif query.data == "unsubscribe_notifications":
+        await unsubscribe_notifications(update, context)
 
     elif query.data == "back_to_menu":
         await show_main_menu(update, context)
@@ -196,7 +340,10 @@ async def show_active_requests(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.close()
 
     if not requests:
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]]
+        keyboard = [
+            [InlineKeyboardButton("🔙 В меню дизайнера", callback_data="designer_mode")],
+            [InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_menu")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.callback_query.edit_message_text(
             "📭 На данный момент активных заявок нет.",
@@ -234,7 +381,8 @@ async def show_active_requests(update: Update, context: ContextTypes.DEFAULT_TYP
         keyboard.append([InlineKeyboardButton(f"Откликнуться на заявку #{req_id}",
                                               callback_data=f"respond_{req_id}")])
 
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
+    keyboard.append([InlineKeyboardButton("🔙 В меню дизайнера", callback_data="designer_mode")])
+    keyboard.append([InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_menu")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.callback_query.edit_message_text(
@@ -315,7 +463,10 @@ async def respond_to_request(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"👤 Заказчик: {request_owner_name}\n"
             f"🔗 Ссылка: {customer_link}\n\n"
             f"📞 Свяжитесь с заказчиком для обсуждения деталей!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 К списку заявок", callback_data="show_active_requests")],
+                [InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_menu")]
+            ])
         )
 
 
@@ -527,6 +678,22 @@ async def get_file_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    context.user_data['usage'],
                    context.user_data['aspect_ratio'],
                    context.user_data['file_format']))
+
+        request_id = c.lastrowid
+
+        conn.commit()
+        conn.close()
+
+        # Рассылаем уведомления подписчикам
+        await notify_subscribers_about_new_request(context, request_id, {
+            'description': context.user_data['description'],
+            'format': context.user_data['format'],
+            'style': context.user_data['style'],
+            'usage': context.user_data['usage'],
+            'aspect_ratio': context.user_data.get('aspect_ratio', 'Не указано'),
+            'file_format': context.user_data.get('file_format', 'Не указан')
+        })
+
     except sqlite3.OperationalError as e:
         if "no such column" in str(e):
             # Если колонок еще нет, добавляем заявку без новых полей
@@ -538,11 +705,23 @@ async def get_file_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        context.user_data['format'],
                        context.user_data['style'],
                        context.user_data['usage']))
+            conn.commit()
+
+            request_id = c.lastrowid
+
+            # Рассылаем уведомления подписчикам
+            await notify_subscribers_about_new_request(context, request_id, {
+                'description': context.user_data['description'],
+                'format': context.user_data['format'],
+                'style': context.user_data['style'],
+                'usage': context.user_data['usage'],
+                'aspect_ratio': 'Не указано',
+                'file_format': 'Не указан'
+            })
         else:
             raise e
-
-    conn.commit()
-    conn.close()
+    finally:
+        conn.close()
 
     # Отправляем подтверждение
     keyboard = [
@@ -583,6 +762,22 @@ async def get_file_format_text(update: Update, context: ContextTypes.DEFAULT_TYP
                    context.user_data['usage'],
                    context.user_data['aspect_ratio'],
                    context.user_data['file_format']))
+
+        request_id = c.lastrowid
+
+        conn.commit()
+        conn.close()
+
+        # Рассылаем уведомления подписчикам
+        await notify_subscribers_about_new_request(context, request_id, {
+            'description': context.user_data['description'],
+            'format': context.user_data['format'],
+            'style': context.user_data['style'],
+            'usage': context.user_data['usage'],
+            'aspect_ratio': context.user_data.get('aspect_ratio', 'Не указано'),
+            'file_format': context.user_data.get('file_format', 'Не указан')
+        })
+
     except sqlite3.OperationalError as e:
         if "no such column" in str(e):
             # Если колонок еще нет, добавляем заявку без новых полей
@@ -594,11 +789,23 @@ async def get_file_format_text(update: Update, context: ContextTypes.DEFAULT_TYP
                        context.user_data['format'],
                        context.user_data['style'],
                        context.user_data['usage']))
+            conn.commit()
+
+            request_id = c.lastrowid
+
+            # Рассылаем уведомления подписчикам
+            await notify_subscribers_about_new_request(context, request_id, {
+                'description': context.user_data['description'],
+                'format': context.user_data['format'],
+                'style': context.user_data['style'],
+                'usage': context.user_data['usage'],
+                'aspect_ratio': 'Не указано',
+                'file_format': 'Не указан'
+            })
         else:
             raise e
-
-    conn.commit()
-    conn.close()
+    finally:
+        conn.close()
 
     # Отправляем подтверждение
     keyboard = [
@@ -669,8 +876,8 @@ def main():
     # Добавление обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(conv_handler)
-    application.add_handler(
-        CallbackQueryHandler(button_handler, pattern='^(designer_mode|my_requests|respond_|delete_|back_to_menu)'))
+    application.add_handler(CallbackQueryHandler(button_handler,
+                                                 pattern='^(designer_mode|show_active_requests|my_requests|respond_|delete_|subscribe_notifications|unsubscribe_notifications|back_to_menu)'))
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
     # Запуск бота
